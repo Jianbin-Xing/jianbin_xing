@@ -1,0 +1,78 @@
+diff --git a/btstack-rootless/port/ios/src/hci_transport_h4_iphone.c b/btstack-rootless/port/ios/src/hci_transport_h4_iphone.c
+--- a/btstack-rootless/port/ios/src/hci_transport_h4_iphone.c
++++ b/btstack-rootless/port/ios/src/hci_transport_h4_iphone.c
+@@ -53,8 +53,8 @@
+ #define SETSOCKOPT_VAL    0x80487414  /* from reversing BTServer */
+ #endif
+ 
+-// don't enforce wake after 3s idle
++// Keep the controller awake after a packet, and give older controllers more
++// time to settle after opening /dev/btwake.
+ #define HCI_WAKE_TIMER_MS 3000
+-#define HCI_WAKE_DURATION 10000
++#define HCI_WAKE_DURATION 100000
+ 
+ #include <errno.h>
+ #include <termios.h>  /* POSIX terminal control definitions */
+@@ -95,6 +95,22 @@ static int read_pos;
+ 
+ static uint8_t hci_packet[1+HCI_INCOMING_PACKET_BUFFER_SIZE]; // packet type + max(acl header + acl payload, event header + event data)
+ 
++static void h4_6s_log_packet(const char *direction, uint8_t packet_type,
++                             const uint8_t *packet, int size){
++    int dump = size > 16 ? 16 : size;
++    char hex[16 * 3 + 1];
++    int pos = 0;
++    for (int i = 0; i < dump; i++){
++        pos += snprintf(&hex[pos], sizeof(hex) - (size_t)pos, "%02x%s",
++                        packet[i], i + 1 == dump ? "" : " ");
++    }
++    hex[pos] = '\0';
++    log_info("h4_6s %s type=0x%02x size=%d data=%s",
++             direction, packet_type, size, hex);
++}
++
+ static void h4_init(const void * transport_config){
+@@ -151,6 +167,7 @@ static int h4_open(void)
+         goto err_out2;
+     }
+     log_info("h4_open: connect to socket ok");
++    log_info("h4_6s: legacy H4 transport attached to %s", SOCKET_DEVICE);
+     
+     // configure UART
+@@ -218,8 +235,10 @@ static int h4_send_packet(uint8_t packet_type, uint8_t * packet, int size){
+ 
+     // wake Bluetooth module
+     h4_enforce_wake_on();
++    log_info("h4_6s: sending HCI packet after wake type=0x%02x size=%d",
++             packet_type, size);
+ 
+     char *data = (char*) packet;
++    h4_6s_log_packet("TX", packet_type, packet, size);
+     int bytes_written = write(hci_transport_h4->uart_fd, &packet_type, 1);
+@@ -253,6 +272,8 @@ static void h4_deliver_packet(void){
+     if (read_pos < 3) return; // sanity check
++    h4_6s_log_packet("RX", hci_packet[0], &hci_packet[1], read_pos - 1);
+     packet_handler(hci_packet[0], &hci_packet[1], read_pos-1);
+@@ -292,6 +313,12 @@ static void h4_process(btstack_data_source_t *ds, btstack_data_source_callback_type_t callback_type) {
+     ssize_t bytes_read = read(hci_transport_h4->uart_fd, &hci_packet[read_pos], read_now);
+     if (bytes_read < 0) {
+@@
+         return;
+     }
++    if (bytes_read == 0) {
++        log_error("h4_6s: controller transport returned EOF while waiting for HCI data");
++        return;
++    }
+@@ -309,9 +336,13 @@ static void h4_enforce_wake_on(void){
+             fprintf(stderr, "h4_enforce_wake_on: open failed path=%s errno=%d (%s)\n",
+                     enforce_wake_device, e, strerror(e));
+             enforce_wake_fd = 0;
++            log_error("h4_6s: continuing without wake fd");
++        } else {
++            log_info("h4_6s: wake device opened path=%s fd=%d",
++                     enforce_wake_device, enforce_wake_fd);
+         }
+-        usleep(HCI_WAKE_DURATION);  // wait until device is ready
++        usleep(HCI_WAKE_DURATION);  // allow controller to settle
+     }
